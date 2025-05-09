@@ -3,10 +3,10 @@
 namespace pxlrbt\FilamentExcel\Exports;
 
 use AnourValar\EloquentSerialize\Facades\EloquentSerializeFacade;
+use Filament\Facades\Filament;
 use Filament\Notifications\Notification;
 use Filament\Resources\RelationManagers\RelationManager;
 use Filament\Support\Concerns\EvaluatesClosures;
-use Filament\Tables\Contracts\HasTable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Str;
 use Livewire\Component;
@@ -16,8 +16,10 @@ use Maatwebsite\Excel\Concerns\ShouldAutoSize;
 use Maatwebsite\Excel\Concerns\WithColumnFormatting;
 use Maatwebsite\Excel\Concerns\WithColumnWidths;
 use Maatwebsite\Excel\Concerns\WithCustomChunkSize;
+use Maatwebsite\Excel\Concerns\WithEvents;
 use Maatwebsite\Excel\Concerns\WithHeadings as HasHeadings;
 use Maatwebsite\Excel\Concerns\WithMapping as HasMapping;
+use Maatwebsite\Excel\Events\BeforeSheet;
 use pxlrbt\FilamentExcel\Events\ExportFinishedEvent;
 use pxlrbt\FilamentExcel\Exports\Concerns\CanIgnoreFormatting;
 use pxlrbt\FilamentExcel\Exports\Concerns\CanModifyQuery;
@@ -35,9 +37,7 @@ use pxlrbt\FilamentExcel\Exports\Concerns\WithWriterType;
 use pxlrbt\FilamentExcel\Interactions\AskForFilename;
 use pxlrbt\FilamentExcel\Interactions\AskForWriterType;
 
-use function Livewire\invade;
-
-class ExcelExport implements FromQuery, HasHeadings, HasMapping, ShouldAutoSize, WithColumnFormatting, WithColumnWidths, WithCustomChunkSize
+class ExcelExport implements FromQuery, HasHeadings, HasMapping, ShouldAutoSize, WithColumnFormatting, WithColumnWidths, WithCustomChunkSize, WithEvents
 {
     use AskForFilename;
     use AskForWriterType;
@@ -89,6 +89,8 @@ class ExcelExport implements FromQuery, HasHeadings, HasMapping, ShouldAutoSize,
 
     protected array $recordIds = [];
 
+    protected bool $isRtl = false;
+
     public function __construct($name)
     {
         $this->name = $name;
@@ -138,7 +140,12 @@ class ExcelExport implements FromQuery, HasHeadings, HasMapping, ShouldAutoSize,
         $this->livewire = app($this->livewireClass);
 
         if ($this->livewire instanceof RelationManager) {
+            $this->livewire->pageClass = $this->livewireClass;
             $this->livewire->ownerRecord = $this->livewireOwnerRecord;
+        }
+
+        if ($this->isQueued) {
+            return $this->livewire;
         }
 
         $this->livewire->bootedInteractsWithTable();
@@ -182,10 +189,14 @@ class ExcelExport implements FromQuery, HasHeadings, HasMapping, ShouldAutoSize,
             return $this->model;
         }
 
-        if (($resource = $this->getResourceClass()) !== null) {
+        $table = $this->getLivewire()->getTable();
+
+        if (($relationship = $table->getRelationship()) !== null) {
+            $model = get_class($relationship->getRelated());
+        } elseif (($resource = $this->getResourceClass()) !== null) {
             $model = $resource::getModel();
-        } elseif (($livewire = $this->getLivewire()) instanceof HasTable) {
-            $model = $livewire->getTable()->getModel();
+        } else {
+            $model = $table->getModel();
         }
 
         return $this->model ??= $model;
@@ -214,11 +225,12 @@ class ExcelExport implements FromQuery, HasHeadings, HasMapping, ShouldAutoSize,
         $this->prepareQueuedExport();
 
         $filename = Str::uuid().'-'.$this->getFilename();
-        $userId = auth()->id();
+        $userId = Filament::auth()->id();
+        $locale = app()->getLocale();
 
         $this
             ->queueExport($filename, 'filament-excel', $this->getWriterType())
-            ->chain([fn () => ExportFinishedEvent::dispatch($filename, $userId)]);
+            ->chain([fn () => ExportFinishedEvent::dispatch($filename, $userId, $locale)]);
 
         Notification::make()
             ->title(__('filament-excel::notifications.queued.title'))
@@ -256,15 +268,14 @@ class ExcelExport implements FromQuery, HasHeadings, HasMapping, ShouldAutoSize,
         $livewire = $this->getLivewire();
         $model = $this->getModelInstance();
 
-        $query = $this->columnsSource === 'table'
-            ? invade($livewire)->getFilteredTableQuery()
+        $query = $this->useTableQuery
+            ? $livewire->getFilteredSortedTableQuery()
             : $this->getModelClass()::query();
 
         if ($this->modifyQueryUsing) {
             $query = app()->call($this->modifyQueryUsing->getClosure(), [
                 'query' => $query,
                 'livewire' => $livewire,
-                'tableQuery' => is_callable([invade($livewire), 'getFilteredTableQuery']) ? invade($livewire)->getFilteredTableQuery() : null
             ]);
         }
 
@@ -297,5 +308,25 @@ class ExcelExport implements FromQuery, HasHeadings, HasMapping, ShouldAutoSize,
             'recordIds' => $this->getRecordIds(),
             'query' => $this->getQuery(),
         ];
+    }
+
+    public function registerEvents(): array
+    {
+        if ($this->isRtl) {
+            return [
+                BeforeSheet::class => function (BeforeSheet $event) {
+                    $event->sheet->getDelegate()->setRightToLeft(true);
+                },
+            ];
+        }
+
+        return [];
+    }
+
+    public function rtl(bool $isRtl = true): static
+    {
+        $this->isRtl = $isRtl;
+
+        return $this;
     }
 }
